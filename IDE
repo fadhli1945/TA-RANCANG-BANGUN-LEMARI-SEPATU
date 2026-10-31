@@ -1,0 +1,793 @@
+// 1. PIN CONFIG
+
+#define DHTPIN_R 8
+#define DHTPIN_L 9
+#define DHTPIN_STORAGE 10
+#define DHTTYPE DHT22
+#define HEATER_PIN 44
+#define FAN_STORAGE_PWM 45
+#define BUZZER 23
+#define BUTTON 24
+#define RELAY_FAN1 33
+#define RELAY_SPRAY_POWER 32
+#define RELAY_UV 31
+#define RELAY_LAMP 30
+#define RELAY_SPRAY_TRIGGER 34
+
+
+// 2. OBJECT
+
+#include <DHT.h> 
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+DHT dhtR(DHTPIN_R, DHTTYPE);
+DHT dhtL(DHTPIN_L, DHTTYPE);
+DHT dhtS(DHTPIN_STORAGE, DHTTYPE);
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+
+// 3. STORAGE PID
+
+float storageSetpoint = 27.0;
+
+float storageLow = 25.0;
+float storageHigh = 29.0;
+
+float KpS = 40.0;
+float KiS = 3.0;
+float KdS = 1.0;
+
+float errorS = 0;
+float lastErrorS = 0;
+float integralS = 0;
+float derivativeS = 0;
+
+float pidStorage = 0;
+
+unsigned long lampWindowStart = 0;
+
+const unsigned long lampWindowSize = 30000UL; // 30 detik
+
+bool modeCold = false;
+bool modeHeat = false;
+bool modeIdle = true;
+
+
+// 4. DRYING PID
+
+float dryingSetpoint = 45.0;
+
+float KpD = 35.0;
+float KiD = 4.0;
+float KdD = 1.0 ;
+
+float errorD = 0;
+float lastErrorD = 0;
+float integralD = 0;
+float derivativeD = 0;
+
+float pidDrying = 0;
+
+
+// 5. SYSTEM STATE
+
+bool dryingON = false;
+bool dryCondition = false;
+bool overheatLock = false;
+
+unsigned long dryStartTime = 0;
+
+const unsigned long dryDelay = 10000; // 10 detik
+
+
+// 6. BUTTON
+
+bool lastButtonState;
+
+unsigned long lastButtonTime = 0;
+const unsigned long debounceDelay = 100;
+
+
+// 7. BOOT PROTECTION
+
+unsigned long bootTimer = 0;
+const unsigned long bootDelay = 1000;
+
+
+// 8. SENSOR TIMER
+
+unsigned long sensorTimer = 0;
+const unsigned long sensorInterval = 2000;
+
+
+// 9. LCD TIMER
+
+unsigned long lcdTimer = 0;
+bool lcdPage = true;
+
+
+// 10. UV TIMER
+
+bool uvState = true;
+
+unsigned long uvTimer = 0;
+
+const unsigned long uvONTime = 180000;
+const unsigned long uvOFFTime = 600000;
+
+
+// 11. SPRAY TIMER
+
+unsigned long sprayTimer = 0;
+
+const unsigned long sprayInterval = 28800000UL; // 8 jam
+
+const unsigned long sprayDuration = 8000; // 8 detik
+
+
+// 12. SENSOR VALUE
+
+float tR = 0;
+float tL = 0;
+float tS = 27;
+
+float hR = 0;
+float hL = 0;
+float hS = 0;
+
+
+// 13. SAFE READ
+
+float safeTemp(DHT &sensor, float lastValue) {
+
+  float value = sensor.readTemperature();
+
+  if (isnan(value)) {
+    return lastValue;
+  }
+
+  return value;
+}
+
+float safeHum(DHT &sensor, float lastValue) {
+
+  float value = sensor.readHumidity();
+
+  if (isnan(value)) {
+    return lastValue;
+  }
+
+  return value;
+}
+
+
+// 14. BUZZER
+
+void shortBeep() {
+
+  digitalWrite(BUZZER, HIGH);
+  delay(150);
+  digitalWrite(BUZZER, LOW);
+}
+
+void longBeep() {
+
+  digitalWrite(BUZZER, HIGH);
+  delay(2500);
+  digitalWrite(BUZZER, LOW);
+}
+
+
+// 15. SETUP
+
+void setup() {
+
+  Serial.begin(9600);
+
+  pinMode(HEATER_PIN, OUTPUT);
+
+  pinMode(BUZZER, OUTPUT);
+
+  pinMode(RELAY_FAN1, OUTPUT);
+  pinMode(RELAY_SPRAY_POWER, OUTPUT);
+  pinMode(RELAY_SPRAY_TRIGGER, OUTPUT);
+  pinMode(FAN_STORAGE_PWM, OUTPUT);
+  pinMode(RELAY_UV, OUTPUT);
+  pinMode(RELAY_LAMP, OUTPUT);
+
+  pinMode(BUTTON, INPUT);
+
+  digitalWrite(HEATER_PIN, LOW);
+  analogWrite(HEATER_PIN, 0);
+
+  digitalWrite(RELAY_FAN1, HIGH);
+  digitalWrite(RELAY_SPRAY_POWER, HIGH);
+  digitalWrite(RELAY_SPRAY_TRIGGER, HIGH);
+  analogWrite(FAN_STORAGE_PWM, 0);
+  digitalWrite(RELAY_UV, HIGH);
+  digitalWrite(RELAY_LAMP, HIGH);
+
+  digitalWrite(BUZZER, LOW);
+
+  dhtR.begin();
+  dhtL.begin();
+  dhtS.begin();
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("WELCOME EVERYONE");
+
+  lcd.setCursor(0, 1);
+  lcd.print("SYSTEM START");
+
+  delay(3000);
+
+  lcd.clear();
+
+  digitalWrite(RELAY_UV, LOW);
+
+  uvState = true;
+  uvTimer = millis();
+
+ sprayTimer = millis();
+
+ // Relay daya ON
+ digitalWrite(RELAY_SPRAY_POWER, LOW);
+
+ // Tunggu 3 detik
+ delay(3000);
+
+ // Relay trigger ON
+ digitalWrite(RELAY_SPRAY_TRIGGER, LOW);
+
+ // Trigger hidup 5 detik
+ delay(5000);
+
+ // Semua OFF bersamaan
+ digitalWrite(RELAY_SPRAY_TRIGGER, HIGH);
+ digitalWrite(RELAY_SPRAY_POWER, HIGH);
+
+ bootTimer = millis();
+
+lampWindowStart = millis();
+
+  lastButtonState = digitalRead(BUTTON);
+}
+
+
+// 16. LOOP
+
+void loop() {
+
+  unsigned long now = millis();
+
+  // SENSOR READ
+
+  if (now - sensorTimer >= sensorInterval) {
+
+    sensorTimer = now;
+
+    tR = safeTemp(dhtR, tR);
+    tL = safeTemp(dhtL, tL);
+    tS = safeTemp(dhtS, tS);
+
+    hR = safeHum(dhtR, hR);
+    hL = safeHum(dhtL, hL);
+    hS = safeHum(dhtS, hS);
+  }
+
+
+  // SPRAY CONTROL
+
+  if (now - sprayTimer >= sprayInterval) {
+
+    sprayTimer = now;
+
+    Serial.println("SPRAY ON");
+
+    // RELAY ACTIVE LOW
+    // Relay daya ON
+      digitalWrite(RELAY_SPRAY_POWER, LOW);
+
+      // Tunggu 3 detik
+      delay(3000);
+
+      // Relay trigger ON
+      digitalWrite(RELAY_SPRAY_TRIGGER, LOW);
+
+      // Trigger hidup 5 detik
+      delay(5000);
+
+      // Semua OFF bersamaan
+      digitalWrite(RELAY_SPRAY_TRIGGER, HIGH);
+      digitalWrite(RELAY_SPRAY_POWER, HIGH);
+  digitalWrite(RELAY_SPRAY_TRIGGER, HIGH);
+
+    Serial.println("SPRAY OFF");
+  }
+
+
+  // BUTTON CONTROL
+
+  if (now - bootTimer >= bootDelay) {
+
+    bool buttonState = digitalRead(BUTTON);
+
+    if (buttonState != lastButtonState) {
+
+      if (now - lastButtonTime > debounceDelay) {
+
+        lastButtonTime = now;
+
+        if (buttonState == LOW) {
+
+          float avgTemp = (tR + tL) / 2.0;
+
+          // JIKA OVERHEAT MASIH PANAS
+
+          if (overheatLock && avgTemp > 35) {
+
+            lcd.clear();
+
+            lcd.setCursor(0, 0);
+            lcd.print("WAIT COOLING");
+
+            lcd.setCursor(0, 1);
+            lcd.print("TEMP HIGH");
+
+            shortBeep();
+
+            delay(2000);
+
+            lcd.clear();
+          }
+
+          // SUHU SUDAH AMAN, BUKA LOCK
+
+          else {
+
+            if (overheatLock && avgTemp <= 35) {
+              overheatLock = false;
+            }
+
+            dryingON = !dryingON;
+
+            // DRYING ON
+
+            if (dryingON) {
+
+              shortBeep();
+
+              dryCondition = false;
+
+              digitalWrite(RELAY_FAN1, LOW);
+
+              lcd.clear();
+
+              lcd.setCursor(0, 0);
+              lcd.print("DRYING START");
+
+              lcd.setCursor(0, 1);
+              lcd.print("PLEASE WAIT");
+
+              delay(2000);
+
+              lcd.clear();
+
+              lcdPage = true;
+              lcdTimer = now;
+
+            Serial.println("DRYING ON");
+            Serial.println("Time,Temp,Humidity,Setpoint,PID");
+            }
+
+            // DRYING OFF MANUAL
+
+            else {
+
+              analogWrite(HEATER_PIN, 0);
+
+              digitalWrite(RELAY_FAN1, HIGH);
+              
+              integralD = 0;
+
+              dryCondition = false;
+
+              lcd.clear();
+
+              lcd.setCursor(1, 0);
+              lcd.print("DRYING");
+
+              lcd.setCursor(4, 1);
+              lcd.print("FINISH");
+
+              longBeep();
+
+              delay(3000);
+
+              lcd.clear();
+
+              Serial.println("DRYING OFF");
+            }
+          }
+        }
+      }
+    }
+
+    lastButtonState = buttonState;
+  }
+
+  // STORAGE MODE
+
+  if (tS < storageLow) {
+
+    modeCold = true;
+    modeHeat = false;
+    modeIdle = false;
+  }
+
+  else if (tS > storageHigh) {
+
+    modeCold = false;
+    modeHeat = true;
+    modeIdle = false;
+  }
+
+  else {
+
+    modeCold = false;
+    modeHeat = false;
+    modeIdle = true;
+  }
+
+  // STORAGE PID
+
+  if (modeCold || modeHeat) {
+
+    if (modeCold) {
+      errorS = storageSetpoint - tS;
+    }
+
+    if (modeHeat) {
+      errorS = tS - storageSetpoint;
+    }
+
+    integralS += errorS;
+
+    if (integralS > 50) integralS = 50;
+    if (integralS < -50) integralS = -50;
+
+    derivativeS = errorS - lastErrorS;
+
+    pidStorage =
+      (KpS * errorS) +
+      (KiS * integralS) +
+      (KdS * derivativeS);
+
+    lastErrorS = errorS;
+
+    if (pidStorage > 255) pidStorage = 255;
+    if (pidStorage < 0) pidStorage = 0;
+  }
+
+  else {
+
+    pidStorage = 0;
+
+    integralS = 0;
+  }
+
+// STORAGE OUTPUT
+
+if (modeCold) {
+
+  analogWrite(FAN_STORAGE_PWM, 0);
+
+  // restart window setiap 30 detik
+  if (now - lampWindowStart >= lampWindowSize) {
+
+    lampWindowStart += lampWindowSize;
+  }
+
+  float lampPercent = pidStorage / 255.0;
+
+  unsigned long onTime =
+      lampPercent * lampWindowSize;
+
+  if ((now - lampWindowStart) < onTime) {
+
+    digitalWrite(RELAY_LAMP, LOW);   // ON
+  }
+
+  else {
+
+    digitalWrite(RELAY_LAMP, HIGH);  // OFF
+  }
+}
+
+else if (modeHeat) {
+
+  digitalWrite(RELAY_LAMP, HIGH);
+
+  analogWrite(FAN_STORAGE_PWM,
+              (int)pidStorage);
+}
+
+else {
+
+  digitalWrite(RELAY_LAMP, HIGH);
+
+  analogWrite(FAN_STORAGE_PWM, 0);
+}
+
+  // UV CONTROL
+
+  if (uvState &&
+      now - uvTimer >= uvONTime) {
+
+    uvState = false;
+
+    uvTimer = now;
+
+    digitalWrite(RELAY_UV, HIGH);
+  }
+
+  if (!uvState &&
+      now - uvTimer >= uvOFFTime) {
+
+    uvState = true;
+
+    uvTimer = now;
+
+    digitalWrite(RELAY_UV, LOW);
+  }
+
+  // DRYING SYSTEM
+
+if (dryingON) {
+
+  digitalWrite(RELAY_FAN1, LOW);
+
+  float avgTemp = (tR + tL) / 2.0;
+
+  errorD = dryingSetpoint - avgTemp;
+
+  integralD += errorD;
+
+  if (integralD > 60) integralD = 60;
+  if (integralD < -60) integralD = -60;
+
+  derivativeD = errorD - lastErrorD;
+
+  pidDrying =
+    (KpD * errorD) +
+    (KiD * integralD) +
+    (KdD * derivativeD);
+
+  lastErrorD = errorD;
+
+  if (pidDrying > 255) pidDrying = 255;
+  if (pidDrying < 0) pidDrying = 0;
+
+
+analogWrite(HEATER_PIN, (int)pidDrying);
+
+
+    // OVERHEAT
+
+    if (tR >= 55 || tL >= 55) {
+
+      dryingON = false;
+      overheatLock = true;
+
+      analogWrite(HEATER_PIN, 0);
+
+      digitalWrite(RELAY_FAN1, HIGH);
+      digitalWrite(RELAY_UV, HIGH);
+
+      dryCondition = false;
+
+      lcd.clear();
+
+      lcd.setCursor(2, 0);
+      lcd.print("OVERHEAT");
+
+      lcd.setCursor(0, 1);
+      lcd.print("SHUTDOWN DRYING");
+
+      longBeep();
+
+      delay(3000);
+
+      lcd.clear();
+    }
+
+    // AUTO STOP
+
+    if (hR <= 46 && hL <= 46) {
+
+      if (!dryCondition) {
+
+        dryCondition = true;
+        dryStartTime = now;
+      }
+
+      if (now - dryStartTime >= dryDelay) {
+
+        dryingON = false;
+
+        analogWrite(HEATER_PIN, 0);
+
+        digitalWrite(RELAY_FAN1, HIGH);
+
+        dryCondition = false;
+
+        lcd.clear();
+
+        lcd.setCursor(0, 0);
+        lcd.print("DRYING DONE");
+
+        lcd.setCursor(0, 1);
+        lcd.print("SYSTEM READY");
+
+        longBeep();
+
+        delay(3000);
+
+        lcd.clear();
+      }
+    }
+
+    else {
+
+      dryCondition = false;
+    }
+  }
+
+  // DRYING OFF
+
+  else {
+
+    analogWrite(HEATER_PIN, 0);
+
+    digitalWrite(RELAY_FAN1, HIGH);
+
+  }
+
+  // LCD DISPLAY
+
+  if (!dryingON) {
+
+    lcd.setCursor(0, 0);
+
+    lcd.print("T:");
+    lcd.print(tS, 1);
+
+    lcd.print(" P:");
+    lcd.print((int)((pidStorage / 255.0) * 100));
+    lcd.print("% ");
+
+    lcd.setCursor(0, 1);
+
+    if (modeCold) {
+
+      lcd.print("COLD        ");
+    }
+
+    else if (modeHeat) {
+
+      lcd.print("HEAT        ");
+    }
+
+    else {
+
+      lcd.print("IDLE        ");
+    }
+  }
+
+  // DRYING ACTIVE
+
+  else {
+
+    if (now - lcdTimer >= 10000) {
+
+      lcdTimer = now;
+
+      lcdPage = !lcdPage;
+
+      lcd.clear();
+    }
+
+    // DRYING PAGE
+
+    if (lcdPage) {
+
+      lcd.setCursor(0, 0);
+
+      lcd.print("DRYING P:");
+
+    int percent =
+    map((int)pidDrying,
+        0,
+        255,
+        0,
+        100);
+        
+        lcd.print(percent);
+        lcd.print("% ");
+
+      lcd.setCursor(0, 1);
+
+      lcd.print("T:");
+      lcd.print(tL, 1);
+
+      lcd.print(" ");
+
+      lcd.print("H:");
+      lcd.print((int)hR);
+      lcd.print("/");
+      lcd.print((int)hL);
+    }
+
+    // STORAGE PAGE
+
+    else {
+
+      lcd.setCursor(0, 0);
+
+      lcd.print("T:");
+      lcd.print(tS, 1);
+
+      lcd.print(" P:");
+      lcd.print((int)((pidStorage / 255.0) * 100));
+      lcd.print("% ");
+
+      lcd.setCursor(0, 1);
+
+      if (modeCold) {
+
+        lcd.print("COLD        ");
+      }
+
+      else if (modeHeat) {
+
+        lcd.print("HEAT        ");
+      }
+
+      else {
+
+        lcd.print("IDLE        ");
+      }
+    }
+  }
+
+// LOG DATA UNTUK EXCEL
+
+static unsigned long lastLog = 0;
+
+if (dryingON && millis() - lastLog >= 5000) {
+ 
+  lastLog = millis();
+
+  float avgTemp = (tR + tL) / 2.0;
+  float avgHum  = (hR + hL) / 2.0;
+
+  Serial.print(millis()/1000);
+  Serial.print(",");
+
+  Serial.print(avgTemp);
+  Serial.print(",");
+
+  Serial.print(avgHum);
+  Serial.print(",");
+
+  Serial.print(dryingSetpoint);
+  Serial.print(",");
+
+  Serial.println(pidDrying);
+}
+}
